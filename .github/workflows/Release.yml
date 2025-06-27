@@ -82,7 +82,7 @@ jobs:
           echo "  targets: [" >> Package.swift
           echo "    .binaryTarget(" >> Package.swift
           echo "      name: \"Libbox\"," >> Package.swift
-          echo "      url: \"https://github.com/EbrahimTahernejad/sing-box-lib/releases/download/${{ github.event.inputs.version }}/Libbox.xcframework.zip\"," >> Package.swift
+          echo "      url: \"https://github.com/alipeng/sing-box-lib/releases/download/${{ github.event.inputs.version }}/Libbox.xcframework.zip\"," >> Package.swift
           echo "      checksum: \"${{ env.file_checksum }}\"" >> Package.swift
           echo "    )" >> Package.swift
           echo "  ]" >> Package.swift
@@ -94,7 +94,7 @@ jobs:
         with:
           commit_message: "Libbox Release ${{ github.event.inputs.version }}"
           commit_user_name: "Ebrahim"
-          commit_user_email: "ebrahimtahernejad@gmail.com"
+          commit_user_email: "njalipeng@gmail.com"
           tagging_message: "${{ github.event.inputs.version }}"
           file_pattern: Package.swift
 
