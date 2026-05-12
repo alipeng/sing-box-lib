@@ -55,7 +55,35 @@ jobs:
         run: |
           cd box
           go run ./cmd/internal/build_libbox -target apple -platform ios,tvos,macos
-          zip -ry ./Libbox.xcframework.zip ./Libbox.xcframework
+
+      # --- Flatten iOS / tvOS slices to shallow bundles (deep bundles fail App Store validation) ---
+      - name: Flatten iOS/tvOS framework slices
+        run: |
+          cd box
+          flatten_framework() {
+            local fw="$1"
+            if [ ! -d "$fw/Versions" ]; then
+              echo "Already shallow: $fw"; return
+            fi
+            local tmp; tmp="$(mktemp -d)"
+            # cp -L = follow symlinks (resolves the Libbox/Headers/Modules/Resources links)
+            cp -RL "$fw/Libbox"  "$tmp/Libbox"
+            cp -RL "$fw/Headers" "$tmp/Headers"
+            cp -RL "$fw/Modules" "$tmp/Modules"
+            # Info.plist sits under Versions/A/Resources/ in deep bundles
+            cp    "$fw/Resources/Info.plist" "$tmp/Info.plist"
+            rm -rf "$fw"
+            mv "$tmp" "$fw"
+          }
+          flatten_framework Libbox.xcframework/ios-arm64/Libbox.framework
+          flatten_framework Libbox.xcframework/tvos-arm64/Libbox.framework
+          # macos slice STAYS deep — macOS requires the versioned bundle layout.
+
+      - name: Repack zip
+        run: |
+          cd box
+          rm -f Libbox.xcframework.zip
+          zip -ry Libbox.xcframework.zip Libbox.xcframework
 
       # --- Generate SHA‑256 checksum for the archive ---
       - name: Detect checksum
