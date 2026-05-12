@@ -12,7 +12,7 @@ let package = Package(
     .binaryTarget(
       name: "Libbox",
       url: "https://github.com/alipeng/sing-box-lib/releases/download/1.13.11/Libbox.xcframework.zip",
-      checksum: "2a8fccb801466c2f1ebdfe7e641837bd85cf39e241c2423adc55d58fbd23c3c5"
+      checksum: "987257404ca24fd552a1e109a562d13c9ef8912c4e8a732f09068921208a257e"
     )
   ]
 )
