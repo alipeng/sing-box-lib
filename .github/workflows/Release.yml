@@ -155,23 +155,29 @@ jobs:
             exit 1
           fi
 
-          # Symbol checks. Use awk on the parsed columns instead of
-          # grep-on-whitespace — the macOS-15 runner's BSD nm separates
-          # `T` from the symbol name with characters that match neither
-          # GNU `\b` nor a literal single space (likely a tab). awk's
-          # default field splitter handles any whitespace cleanly.
-          FOUND=0
-
-          echo "=== nm -gU ==="
+          # Print nm output for the run log (diagnostics only — pass/fail
+          # below is decided by the raw byte scan instead). Using nm +
+          # `if` under `set -o pipefail` is fragile: when awk hits the
+          # symbol and `exit`s, nm gets SIGPIPE (exit 141), pipefail
+          # propagates that, and the `if` skips the success branch even
+          # though awk did match. Don't go down that road.
+          echo "=== nm -gU (top LibboxSetup-related symbols) ==="
           nm -gU "$IOS_LIB" 2>&1 | awk '/_LibboxSetup/{print; n++} n==5{exit}' || true
-          if nm -gU "$IOS_LIB" 2>&1 | awk '$2 == "T" && $3 == "_LibboxSetup" {found=1; exit} END {exit !found}'; then FOUND=1; fi
 
-          echo "=== nm --defined-only ==="
+          echo "=== nm --defined-only (top LibboxSetup-related symbols) ==="
           nm --defined-only "$IOS_LIB" 2>&1 | awk '/_LibboxSetup/{print; n++} n==5{exit}' || true
-          if nm --defined-only "$IOS_LIB" 2>&1 | awk '$2 == "T" && $3 == "_LibboxSetup" {found=1; exit} END {exit !found}'; then FOUND=1; fi
 
-          if [ "$FOUND" -eq 0 ]; then
-            echo "::error::iOS Libbox binary has no _LibboxSetup text symbol — link failed."
+          # Authoritative check: scan the binary's raw bytes for the
+          # literal symbol-name string. The string `LibboxSetup` only
+          # appears in a Mach-O archive when sing-box's libbox module
+          # was actually linked in — independent of nm/awk versions
+          # and pipe behavior. `|| true` keeps `set -e` from aborting
+          # when grep returns 1 (no match → count=0).
+          echo "=== raw byte scan for 'LibboxSetup' ==="
+          COUNT_RAW=$(LC_ALL=C tr '\0' '\n' < "$IOS_LIB" | grep -c "LibboxSetup" || true)
+          echo "occurrences of 'LibboxSetup' in raw bytes: $COUNT_RAW"
+          if [ "$COUNT_RAW" -lt 5 ]; then
+            echo "::error::iOS Libbox binary has only $COUNT_RAW occurrences of 'LibboxSetup' — link failed."
             exit 1
           fi
           echo "iOS Libbox binary OK."
