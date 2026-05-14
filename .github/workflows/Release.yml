@@ -4,88 +4,155 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version"
+        description: "Release version (this repo's tag, e.g. 1.13.11-fix3)"
         required: true
         type: string
       tag:
-        description: "Git Tag to checkout"
+        description: "sing-box upstream git tag (e.g. v1.13.11)"
         required: true
         type: string
 
 jobs:
   release:
     runs-on: macOS-15
-
-    # Allow the workflow to push tags/commits back to the repo
     permissions:
       contents: write
 
     steps:
-      # --- Check out main repository (actions/checkout@v4) ---
+      # 1) Check out this repo (we only need .github/ + Package.swift here).
       - uses: actions/checkout@v4
 
-      # --- Check out sing-box source at the requested tag ---
+      # 2) Check out SagerNet/sing-box at the requested upstream tag —
+      #    everything below mirrors that repo's
+      #    `.github/workflows/build.yml` "Build library" step.
       - uses: actions/checkout@v4
         with:
           repository: SagerNet/sing-box
           path: box
           ref: ${{ github.event.inputs.tag }}
 
-      # --- Set up Go (actions/setup-go@v5) ---
+      # 3) Go version aligned with upstream sing-box's build.yml.
+      #    `~1.25.9` matches what SFI/SFM/SFT are built against today.
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23.1"
+          go-version: ~1.25.9
 
-      # --- Set up Node (actions/setup-node@v4) ---
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      # --- Install gomobile toolchain ---
-      - name: Setup Gomobile
+      # 4) `make lib_install` installs gomobile + gobind into $GOPATH/bin
+      #    (`go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12`).
+      #    Subsequent steps need that bin dir on PATH so `build_libbox`
+      #    can find `gomobile`.
+      - name: Install gomobile toolchain
         run: |
           cd box
           make lib_install
-          gomobile init
 
-      # --- Build the iOS xcframework ---
+      # 5) Build the xcframework using sing-box's own build_libbox driver.
+      #    Identical invocation to upstream's "Build library" step. The
+      #    driver applies the right build tags + ldflags
+      #    (`-X internal/godebug.defaultGODEBUG=multipathtcp=0`,
+      #    `with_tailscale + ts_omit_*` slimming, `with_low_memory` for
+      #    iOS/tvOS, etc.) — DO NOT replace this with a hand-rolled
+      #    `gomobile bind` invocation or those settings get lost.
       - name: Build xcframework
         run: |
           cd box
+          export PATH="$PATH:$(go env GOPATH)/bin"
           go run ./cmd/internal/build_libbox -target apple -platform ios,tvos,macos
 
-      # --- Flatten iOS / tvOS slices to shallow bundles (deep bundles fail App Store validation) ---
-      - name: Flatten iOS/tvOS framework slices
+      # 6) gomobile emits Versions/A-style deep bundles for every slice.
+      #    iOS and tvOS apps REQUIRE shallow framework bundles for App
+      #    Store submission; we flatten those two slices to look like:
+      #
+      #        Libbox.framework/
+      #        ├── Headers/
+      #        ├── Info.plist
+      #        ├── Libbox            (binary)
+      #        └── Modules/
+      #
+      #    The macOS slice stays deep — macOS REQUIRES the versioned layout.
+      #
+      #    Critically, the outer xcframework Info.plist also tracks each
+      #    slice's BinaryPath. If we flatten the bundle without rewriting
+      #    those entries, Xcode embeds an empty stub binary (it can't
+      #    find `Versions/A/Libbox` inside a flattened bundle) and
+      #    dyld then fails to resolve every Libbox symbol at runtime.
+      #    Rewrite both per-slice layout AND outer Info.plist together.
+      - name: Flatten iOS/tvOS slices + sync xcframework Info.plist
         run: |
+          set -euo pipefail
           cd box
+
           flatten_framework() {
             local fw="$1"
             if [ ! -d "$fw/Versions" ]; then
-              echo "Already shallow: $fw"; return
+              echo "Already shallow: $fw"
+              return
             fi
             local tmp; tmp="$(mktemp -d)"
-            # cp -L = follow symlinks (resolves the Libbox/Headers/Modules/Resources links)
+            # -L follows the Versions/Current symlink chain so we copy
+            # the real files, not dangling links.
             cp -RL "$fw/Libbox"  "$tmp/Libbox"
             cp -RL "$fw/Headers" "$tmp/Headers"
             cp -RL "$fw/Modules" "$tmp/Modules"
-            # Info.plist sits under Versions/A/Resources/ in deep bundles
             cp    "$fw/Resources/Info.plist" "$tmp/Info.plist"
             rm -rf "$fw"
             mv "$tmp" "$fw"
           }
+
           flatten_framework Libbox.xcframework/ios-arm64/Libbox.framework
           flatten_framework Libbox.xcframework/tvos-arm64/Libbox.framework
-          # macos slice STAYS deep — macOS requires the versioned bundle layout.
 
+          # Patch the outer xcframework Info.plist so each slice's
+          # BinaryPath matches its on-disk layout.
+          PLIST=Libbox.xcframework/Info.plist
+          COUNT=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" | grep -c "^    Dict {")
+          for ((i=0; i<COUNT; i++)); do
+            id=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$i:LibraryIdentifier" "$PLIST")
+            if [[ "$id" == macos* ]]; then
+              /usr/libexec/PlistBuddy -c \
+                "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Versions/A/Libbox" "$PLIST"
+            else
+              /usr/libexec/PlistBuddy -c \
+                "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Libbox" "$PLIST"
+            fi
+          done
+
+          echo "=== xcframework Info.plist after patching ==="
+          /usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" \
+            | grep -E "BinaryPath|LibraryIdentifier"
+
+      # 7) Sanity check: the iOS Libbox binary must NOT be a 33KB stub.
+      #    Fail the build loudly if gomobile emitted an empty slice.
+      - name: Verify iOS slice has real Libbox symbols
+        run: |
+          set -euo pipefail
+          cd box
+          IOS_LIB=Libbox.xcframework/ios-arm64/Libbox.framework/Libbox
+          if [ ! -f "$IOS_LIB" ]; then
+            echo "::error::Missing iOS Libbox binary at $IOS_LIB"
+            exit 1
+          fi
+          SIZE=$(stat -f%z "$IOS_LIB")
+          echo "iOS Libbox size: $SIZE bytes"
+          if [ "$SIZE" -lt 10000000 ]; then
+            echo "::error::iOS Libbox binary is $SIZE bytes (<10MB) — looks like an empty stub. Build is broken."
+            exit 1
+          fi
+          # Spot-check that core Libbox + sing-box symbols are present.
+          if ! nm -gU "$IOS_LIB" 2>/dev/null | grep -q " T _LibboxSetup"; then
+            echo "::error::iOS Libbox binary is missing _LibboxSetup — link failed."
+            exit 1
+          fi
+          echo "iOS Libbox binary OK."
+
+      # 8) Repackage + checksum + manifest + release.
       - name: Repack zip
         run: |
           cd box
           rm -f Libbox.xcframework.zip
           zip -ry Libbox.xcframework.zip Libbox.xcframework
 
-      # --- Generate SHA‑256 checksum for the archive ---
       - name: Detect checksum
         id: checksum
         shell: bash
@@ -93,30 +160,30 @@ jobs:
           CHECKSUM=$(shasum -a 256 box/Libbox.xcframework.zip | awk '{print $1}')
           echo "file_checksum=$CHECKSUM" >> "$GITHUB_ENV"
 
-      # --- Generate SwiftPM manifest that points at the new binary target ---
       - name: Update Package.swift
         shell: bash
         run: |
-          echo "// swift-tools-version: 5.7" > Package.swift
-          echo "" >> Package.swift
-          echo "import PackageDescription" >> Package.swift
-          echo "" >> Package.swift
-          echo "let package = Package(" >> Package.swift
-          echo "  name: \"Libbox\"," >> Package.swift
-          echo "  platforms: [.iOS(.v12)]," >> Package.swift
-          echo "  products: [" >> Package.swift
-          echo "    .library(name: \"Libbox\", targets: [\"Libbox\"])," >> Package.swift
-          echo "  ]," >> Package.swift
-          echo "  targets: [" >> Package.swift
-          echo "    .binaryTarget(" >> Package.swift
-          echo "      name: \"Libbox\"," >> Package.swift
-          echo "      url: \"https://github.com/alipeng/sing-box-lib/releases/download/${{ github.event.inputs.version }}/Libbox.xcframework.zip\"," >> Package.swift
-          echo "      checksum: \"${{ env.file_checksum }}\"" >> Package.swift
-          echo "    )" >> Package.swift
-          echo "  ]" >> Package.swift
-          echo ")" >> Package.swift
+          cat > Package.swift <<EOF
+          // swift-tools-version: 5.7
 
-      # --- Commit the manifest and tag the commit (stefanzweifel/git-auto-commit-action@v5) ---
+          import PackageDescription
+
+          let package = Package(
+            name: "Libbox",
+            platforms: [.iOS(.v12)],
+            products: [
+              .library(name: "Libbox", targets: ["Libbox"]),
+            ],
+            targets: [
+              .binaryTarget(
+                name: "Libbox",
+                url: "https://github.com/alipeng/sing-box-lib/releases/download/${{ github.event.inputs.version }}/Libbox.xcframework.zip",
+                checksum: "${{ env.file_checksum }}"
+              )
+            ]
+          )
+          EOF
+
       - name: Commit manifest & tag
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -126,11 +193,10 @@ jobs:
           tagging_message: "${{ github.event.inputs.version }}"
           file_pattern: Package.swift
 
-      # --- Publish GitHub release (softprops/action-gh-release@v2) ---
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
           tag_name: ${{ github.event.inputs.version }}
-          body: "Compiled from source tag: ${{ github.event.inputs.tag }}"
+          body: "Compiled from sing-box source tag: ${{ github.event.inputs.tag }}"
           files: box/Libbox.xcframework.zip
