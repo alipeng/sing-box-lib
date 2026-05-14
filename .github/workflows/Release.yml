@@ -155,21 +155,20 @@ jobs:
             exit 1
           fi
 
-          # Symbol checks. The macOS-15 runner ships BSD grep, which
-          # doesn't support `\b` (GNU extension), so we anchor with a
-          # literal-space prefix instead — `nm` output for a static
-          # archive is `<addr-or-dashes> T _Symbol`, so " T _LibboxSetup"
-          # uniquely identifies the function symbol without colliding
-          # with `_OBJC_CLASS_$_LibboxSetupOptions` and friends.
+          # Symbol checks. Use awk on the parsed columns instead of
+          # grep-on-whitespace — the macOS-15 runner's BSD nm separates
+          # `T` from the symbol name with characters that match neither
+          # GNU `\b` nor a literal single space (likely a tab). awk's
+          # default field splitter handles any whitespace cleanly.
           FOUND=0
 
           echo "=== nm -gU ==="
-          nm -gU "$IOS_LIB" 2>&1 | grep -F "_LibboxSetup" | head -5 || true
-          if nm -gU "$IOS_LIB" 2>&1 | grep -qF " T _LibboxSetup"; then FOUND=1; fi
+          nm -gU "$IOS_LIB" 2>&1 | awk '/_LibboxSetup/{print; n++} n==5{exit}' || true
+          if nm -gU "$IOS_LIB" 2>&1 | awk '$2 == "T" && $3 == "_LibboxSetup" {found=1; exit} END {exit !found}'; then FOUND=1; fi
 
           echo "=== nm --defined-only ==="
-          nm --defined-only "$IOS_LIB" 2>&1 | grep -F "_LibboxSetup" | head -5 || true
-          if nm --defined-only "$IOS_LIB" 2>&1 | grep -qF " T _LibboxSetup"; then FOUND=1; fi
+          nm --defined-only "$IOS_LIB" 2>&1 | awk '/_LibboxSetup/{print; n++} n==5{exit}' || true
+          if nm --defined-only "$IOS_LIB" 2>&1 | awk '$2 == "T" && $3 == "_LibboxSetup" {found=1; exit} END {exit !found}'; then FOUND=1; fi
 
           if [ "$FOUND" -eq 0 ]; then
             echo "::error::iOS Libbox binary has no _LibboxSetup text symbol — link failed."
