@@ -54,15 +54,20 @@ jobs:
       #    `with_tailscale + ts_omit_*` slimming, `with_low_memory` for
       #    iOS/tvOS, etc.) — DO NOT replace this with a hand-rolled
       #    `gomobile bind` invocation or those settings get lost.
+      # `-platform ios` produces a single-slice (ios-arm64) xcframework
+      # — half the zip size of the full ios,tvos,macos build. Final iOS
+      # app .ipa size is unaffected (Xcode only embeds the iOS slice
+      # regardless), this just shrinks the SwiftPM download + cache.
+      # Add `tvos`/`macos` back if you ever ship a Companion app.
       - name: Build xcframework
         run: |
           cd box
           export PATH="$PATH:$(go env GOPATH)/bin"
-          go run ./cmd/internal/build_libbox -target apple -platform ios,tvos,macos
+          go run ./cmd/internal/build_libbox -target apple -platform ios
 
-      # 6) gomobile emits Versions/A-style deep bundles for every slice.
-      #    iOS and tvOS apps REQUIRE shallow framework bundles for App
-      #    Store submission; we flatten those two slices to look like:
+      # 6) gomobile emits a Versions/A-style deep bundle. iOS apps
+      #    REQUIRE shallow framework bundles for App Store submission,
+      #    so flatten the ios-arm64 slice to:
       #
       #        Libbox.framework/
       #        ├── Headers/
@@ -70,15 +75,14 @@ jobs:
       #        ├── Libbox            (binary)
       #        └── Modules/
       #
-      #    The macOS slice stays deep — macOS REQUIRES the versioned layout.
-      #
-      #    Critically, the outer xcframework Info.plist also tracks each
-      #    slice's BinaryPath. If we flatten the bundle without rewriting
-      #    those entries, Xcode embeds an empty stub binary (it can't
-      #    find `Versions/A/Libbox` inside a flattened bundle) and
-      #    dyld then fails to resolve every Libbox symbol at runtime.
-      #    Rewrite both per-slice layout AND outer Info.plist together.
-      - name: Flatten iOS/tvOS slices + sync xcframework Info.plist
+      #    Critically the outer xcframework Info.plist also tracks the
+      #    slice's BinaryPath. If we flatten the bundle without
+      #    rewriting that entry, Xcode embeds an empty stub binary
+      #    (it can't find `Versions/A/Libbox` inside a flattened
+      #    bundle) and dyld then fails to resolve every Libbox symbol
+      #    at runtime. Rewrite per-slice layout AND outer Info.plist
+      #    together.
+      - name: Flatten iOS slice + sync xcframework Info.plist
         run: |
           set -euo pipefail
           cd box
@@ -101,10 +105,12 @@ jobs:
           }
 
           flatten_framework Libbox.xcframework/ios-arm64/Libbox.framework
-          flatten_framework Libbox.xcframework/tvos-arm64/Libbox.framework
 
-          # Patch the outer xcframework Info.plist so each slice's
-          # BinaryPath matches its on-disk layout.
+          # Patch the outer xcframework Info.plist so every slice's
+          # BinaryPath matches its on-disk layout. iOS slice is now
+          # shallow (`Libbox.framework/Libbox`); if a tvos/macos slice
+          # is ever re-added, the macOS entry must keep
+          # `Versions/A/Libbox`.
           PLIST=Libbox.xcframework/Info.plist
           COUNT=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" | grep -c "^    Dict {")
           for ((i=0; i<COUNT; i++)); do
