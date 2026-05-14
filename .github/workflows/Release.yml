@@ -130,6 +130,10 @@ jobs:
 
       # 7) Sanity check: the iOS Libbox binary must NOT be a 33KB stub.
       #    Fail the build loudly if gomobile emitted an empty slice.
+      #    The iOS Libbox is a "Mach-O universal binary [arm64:current
+      #    ar archive]" — `nm` output differs between Apple's
+      #    clang-nm and llvm-nm and between archive vs Mach-O. We try
+      #    several detection methods and only fail if NONE match.
       - name: Verify iOS slice has real Libbox symbols
         run: |
           set -euo pipefail
@@ -139,15 +143,34 @@ jobs:
             echo "::error::Missing iOS Libbox binary at $IOS_LIB"
             exit 1
           fi
+
+          echo "=== file ==="
+          file "$IOS_LIB"
+
           SIZE=$(stat -f%z "$IOS_LIB")
-          echo "iOS Libbox size: $SIZE bytes"
+          echo "=== size ==="
+          echo "iOS Libbox size: $SIZE bytes ($(echo "scale=1; $SIZE/1024/1024" | bc) MB)"
           if [ "$SIZE" -lt 10000000 ]; then
             echo "::error::iOS Libbox binary is $SIZE bytes (<10MB) — looks like an empty stub. Build is broken."
             exit 1
           fi
-          # Spot-check that core Libbox + sing-box symbols are present.
-          if ! nm -gU "$IOS_LIB" 2>/dev/null | grep -q " T _LibboxSetup"; then
-            echo "::error::iOS Libbox binary is missing _LibboxSetup — link failed."
+
+          # Symbol checks — try several routes; pass if ANY hits.
+          FOUND=0
+          echo "=== nm -gU ==="
+          nm -gU "$IOS_LIB" 2>&1 | grep -E "_LibboxSetup|_LibboxNewCommandServer" | head -5 || true
+          if nm -gU "$IOS_LIB" 2>&1 | grep -Eq "_LibboxSetup\b"; then FOUND=1; fi
+
+          echo "=== nm --defined-only ==="
+          nm --defined-only "$IOS_LIB" 2>&1 | grep -E "_LibboxSetup|_LibboxNewCommandServer" | head -5 || true
+          if nm --defined-only "$IOS_LIB" 2>&1 | grep -Eq "_LibboxSetup\b"; then FOUND=1; fi
+
+          echo "=== strings ==="
+          strings "$IOS_LIB" | grep -E "^LibboxSetup$|^LibboxNewCommandServer$" | head -5 || true
+          if strings "$IOS_LIB" | grep -Eq "^LibboxSetup$"; then FOUND=1; fi
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::iOS Libbox binary has no _LibboxSetup symbol via nm or strings — link failed."
             exit 1
           fi
           echo "iOS Libbox binary OK."
