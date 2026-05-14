@@ -71,8 +71,44 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
         -target apple -platform "$PLATFORM" )
     ok "build_libbox finished"
 
-    hdr "Flatten iOS slice + sync xcframework Info.plist"
+    hdr "Flatten non-macOS slices + write real Info.plist + sync xcframework Info.plist"
     cd "$SINGBOX_DIR"
+
+    # gomobile bind emits a placeholder Info.plist with `<dict></dict>` —
+    # Xcode embed-frameworks rejects that with "Info.plist was empty".
+    # Replace it with a real CFBundle* manifest so the framework can be
+    # consumed as-is by downstream apps. The version field tracks the
+    # sing-box tag we're building from.
+    write_framework_info_plist() {
+        local dest="$1"
+        local short_ver="$2"
+        cat > "$dest" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Libbox</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.sagernet.libbox</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Libbox</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${short_ver}</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>MinimumOSVersion</key>
+    <string>12.0</string>
+</dict>
+</plist>
+EOF
+    }
 
     flatten_framework() {
         local fw="$1"
@@ -84,35 +120,45 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
         cp -RL "$fw/Libbox"  "$tmp/Libbox"
         cp -RL "$fw/Headers" "$tmp/Headers"
         cp -RL "$fw/Modules" "$tmp/Modules"
-        cp    "$fw/Resources/Info.plist" "$tmp/Info.plist"
         rm -rf "$fw"
         mv "$tmp" "$fw"
     }
 
-    if [ -d Libbox.xcframework/ios-arm64/Libbox.framework ]; then
-        flatten_framework Libbox.xcframework/ios-arm64/Libbox.framework
-    fi
-    if [ -d Libbox.xcframework/tvos-arm64/Libbox.framework ]; then
-        flatten_framework Libbox.xcframework/tvos-arm64/Libbox.framework
-    fi
+    # Pull the sing-box tag (the input to `git checkout` earlier) without
+    # the leading `v`, for the framework's CFBundleShortVersionString.
+    SHORT_VER="${SINGBOX_TAG#v}"
 
+    # Iterate every slice via the xcframework manifest. Flatten non-macOS
+    # slices, then write a real Info.plist into the slice's framework at
+    # the correct path (top-level for flat, Versions/A/Resources/ for
+    # macOS deep bundles).
     PLIST=Libbox.xcframework/Info.plist
     COUNT=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" | grep -c "^    Dict {")
     echo "  Slices in xcframework: $COUNT"
     for ((i=0; i<COUNT; i++)); do
         id=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$i:LibraryIdentifier" "$PLIST")
+        fw="Libbox.xcframework/$id/Libbox.framework"
+        echo "  --- $id ---"
         if [[ "$id" == macos* ]]; then
+            # macOS keeps versioned deep bundle. Write Info.plist into
+            # Versions/A/Resources/ where macOS dyld expects it.
+            mkdir -p "$fw/Versions/A/Resources"
+            write_framework_info_plist "$fw/Versions/A/Resources/Info.plist" "$SHORT_VER"
             /usr/libexec/PlistBuddy -c \
                 "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Versions/A/Libbox" "$PLIST"
         else
+            # iOS / tvOS / simulator: shallow bundle with Info.plist at the top.
+            flatten_framework "$fw"
+            write_framework_info_plist "$fw/Info.plist" "$SHORT_VER"
             /usr/libexec/PlistBuddy -c \
                 "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Libbox" "$PLIST"
         fi
     done
-    echo "  --- final BinaryPath / LibraryIdentifier ---"
+
+    echo "  --- final outer xcframework BinaryPath / LibraryIdentifier ---"
     /usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" \
         | grep -E "BinaryPath|LibraryIdentifier" | sed 's/^/  /'
-    ok "framework structure + Info.plist consistent"
+    ok "framework structure + per-slice Info.plist + outer xcframework manifest consistent"
 fi
 
 # ---------- Verify (mirrors workflow step 7) ----------

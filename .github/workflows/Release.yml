@@ -65,66 +65,91 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin"
           go run ./cmd/internal/build_libbox -target apple -platform ios
 
-      # 6) gomobile emits a Versions/A-style deep bundle. iOS apps
-      #    REQUIRE shallow framework bundles for App Store submission,
-      #    so flatten the ios-arm64 slice to:
-      #
-      #        Libbox.framework/
-      #        ├── Headers/
-      #        ├── Info.plist
-      #        ├── Libbox            (binary)
-      #        └── Modules/
-      #
-      #    Critically the outer xcframework Info.plist also tracks the
-      #    slice's BinaryPath. If we flatten the bundle without
-      #    rewriting that entry, Xcode embeds an empty stub binary
-      #    (it can't find `Versions/A/Libbox` inside a flattened
-      #    bundle) and dyld then fails to resolve every Libbox symbol
-      #    at runtime. Rewrite per-slice layout AND outer Info.plist
-      #    together.
-      - name: Flatten iOS slice + sync xcframework Info.plist
+      # 6) Post-process every slice in the xcframework:
+      #    a. Non-macOS slices (ios / iossimulator / tvos / tvossimulator)
+      #       get flattened from `Versions/A/...` (gomobile's deep-bundle
+      #       default) to a shallow framework that iOS Embed Frameworks
+      #       accepts. macOS slices stay deep (macOS requires it).
+      #    b. gomobile bind emits a placeholder Info.plist
+      #       (`<dict></dict>`) inside every framework — Xcode rejects
+      #       it at embed time with "Info.plist was empty". Overwrite
+      #       with a real CFBundle* manifest so downstream apps can
+      #       consume the framework as-is without a Run Script patch.
+      #    c. Sync the outer xcframework manifest's BinaryPath per
+      #       slice so Xcode finds the binary at the right path.
+      - name: Flatten non-macOS slices + write Info.plist + sync xcframework manifest
         run: |
           set -euo pipefail
           cd box
 
+          SHORT_VER="${{ github.event.inputs.tag }}"
+          SHORT_VER="${SHORT_VER#v}"
+
+          write_framework_info_plist() {
+            local dest="$1"
+            cat > "$dest" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleExecutable</key>
+              <string>Libbox</string>
+              <key>CFBundleIdentifier</key>
+              <string>org.sagernet.libbox</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>Libbox</string>
+              <key>CFBundlePackageType</key>
+              <string>FMWK</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${SHORT_VER}</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>MinimumOSVersion</key>
+              <string>12.0</string>
+          </dict>
+          </plist>
+          EOF
+          }
+
           flatten_framework() {
             local fw="$1"
             if [ ! -d "$fw/Versions" ]; then
-              echo "Already shallow: $fw"
-              return
+              echo "Already shallow: $fw"; return
             fi
             local tmp; tmp="$(mktemp -d)"
-            # -L follows the Versions/Current symlink chain so we copy
-            # the real files, not dangling links.
+            # -L follows the Versions/Current symlinks.
             cp -RL "$fw/Libbox"  "$tmp/Libbox"
             cp -RL "$fw/Headers" "$tmp/Headers"
             cp -RL "$fw/Modules" "$tmp/Modules"
-            cp    "$fw/Resources/Info.plist" "$tmp/Info.plist"
             rm -rf "$fw"
             mv "$tmp" "$fw"
           }
 
-          flatten_framework Libbox.xcframework/ios-arm64/Libbox.framework
-
-          # Patch the outer xcframework Info.plist so every slice's
-          # BinaryPath matches its on-disk layout. iOS slice is now
-          # shallow (`Libbox.framework/Libbox`); if a tvos/macos slice
-          # is ever re-added, the macOS entry must keep
-          # `Versions/A/Libbox`.
           PLIST=Libbox.xcframework/Info.plist
           COUNT=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" | grep -c "^    Dict {")
+          echo "Slices in xcframework: $COUNT"
           for ((i=0; i<COUNT; i++)); do
             id=$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$i:LibraryIdentifier" "$PLIST")
+            fw="Libbox.xcframework/$id/Libbox.framework"
+            echo "--- $id ---"
             if [[ "$id" == macos* ]]; then
+              mkdir -p "$fw/Versions/A/Resources"
+              write_framework_info_plist "$fw/Versions/A/Resources/Info.plist"
               /usr/libexec/PlistBuddy -c \
                 "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Versions/A/Libbox" "$PLIST"
             else
+              flatten_framework "$fw"
+              write_framework_info_plist "$fw/Info.plist"
               /usr/libexec/PlistBuddy -c \
                 "Set :AvailableLibraries:$i:BinaryPath Libbox.framework/Libbox" "$PLIST"
             fi
           done
 
-          echo "=== xcframework Info.plist after patching ==="
+          echo "=== final xcframework Info.plist ==="
           /usr/libexec/PlistBuddy -c "Print :AvailableLibraries" "$PLIST" \
             | grep -E "BinaryPath|LibraryIdentifier"
 
